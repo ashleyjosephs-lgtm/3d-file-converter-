@@ -1,0 +1,6 @@
+{
+  "name": "MeshShift — 3D GLB Converter",
+  "description": "Windows desktop-style 3D asset converter for inspecting GLB files and converting them to FBX, OBJ, and SketchUp-ready formats.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
