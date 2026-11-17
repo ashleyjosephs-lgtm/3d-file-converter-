@@ -28,6 +28,14 @@ interface FbxNode {
 
 const FBX_VERSION = 7400;
 const FBX_HEADER_MAGIC = 'Kaydara FBX Binary  \0';
+// Autodesk FBX SDK validates an anti-tamper hash linking CreationTime + FileId -> FooterId.
+// These exact matched constants (used by Blender io_scene_fbx & Assimp FBXExporter) are
+// required so 3ds Max / Maya / MotionBuilder (libfbxsdk) accept the binary stream.
+const FBX_CREATION_TIME = '1970-01-01 10:00:00:000';
+const FBX_FILE_ID = new Uint8Array([
+  0x28, 0xb3, 0x2a, 0xeb, 0xb6, 0x24, 0xcc, 0xc2,
+  0xbf, 0xc8, 0xb0, 0x2a, 0xa9, 0x2b, 0xfc, 0xf1,
+]);
 const FBX_FOOTER_ID = new Uint8Array([
   0xfa, 0xbc, 0xab, 0x09, 0xd0, 0xc8, 0xd4, 0x66,
   0xb1, 0x76, 0xfb, 0x83, 0x1c, 0xf7, 0x26, 0x7e,
@@ -261,23 +269,35 @@ interface CompactedMeshArrays {
   normals: Float64Array;
   uvs: Float64Array;
   uvIndices: Int32Array;
+  uvs2?: Float64Array;
+  colors?: Float64Array;
+  smoothing: Int32Array;
   bboxMin: [number, number, number];
   bboxMax: [number, number, number];
 }
 
-function buildCompactMeshArrays(mesh: ExtractedMeshData): CompactedMeshArrays | null {
+function buildCompactMeshArrays(
+  mesh: ExtractedMeshData
+): CompactedMeshArrays | null {
   const srcVertCount = Math.floor(mesh.positions.length / 3);
   if (srcVertCount === 0 || mesh.indices.length < 3) {
     return null;
   }
 
-  // Remap only vertices actually referenced by valid non-degenerate triangles
+  const hasUv2 = Boolean(mesh.uvs2 && mesh.uvs2.length >= srcVertCount * 2);
+  const hasColors = Boolean(
+    mesh.colors && mesh.colors.length >= srcVertCount * 4
+  );
+
+  // Remap only vertices referenced by valid non-degenerate triangles
   const srcToDst = new Int32Array(srcVertCount).fill(-1);
   const compactVertCoords: number[] = [];
   const compactUvCoords: number[] = [];
+  const compactUv2Coords: number[] = [];
   const polyIndices: number[] = [];
   const normValues: number[] = [];
   const uvIndexValues: number[] = [];
+  const colorValues: number[] = [];
 
   let minX = Infinity;
   let minY = Infinity;
@@ -306,6 +326,12 @@ function buildCompactMeshArrays(mesh: ExtractedMeshData): CompactedMeshArrays | 
     const u = safeNum(mesh.uvs[srcIdx * 2]);
     const v = safeNum(mesh.uvs[srcIdx * 2 + 1]);
     compactUvCoords.push(u, v);
+
+    if (hasUv2 && mesh.uvs2) {
+      const u2 = safeNum(mesh.uvs2[srcIdx * 2]);
+      const v2 = safeNum(mesh.uvs2[srcIdx * 2 + 1]);
+      compactUv2Coords.push(u2, v2);
+    }
 
     srcToDst[srcIdx] = dstCount;
     dstCount += 1;
@@ -362,12 +388,23 @@ function buildCompactMeshArrays(mesh: ExtractedMeshData): CompactedMeshArrays | 
       const nz = safeNum(mesh.normals[srcIdx * 3 + 2], 0);
       normValues.push(nx, ny, nz);
       uvIndexValues.push(dstIdx);
+
+      if (hasColors && mesh.colors) {
+        const cr = safeNum(mesh.colors[srcIdx * 4], 1);
+        const cg = safeNum(mesh.colors[srcIdx * 4 + 1], 1);
+        const cb = safeNum(mesh.colors[srcIdx * 4 + 2], 1);
+        const ca = safeNum(mesh.colors[srcIdx * 4 + 3], 1);
+        colorValues.push(cr, cg, cb, ca);
+      }
     }
   }
 
   if (polyIndices.length === 0 || dstCount === 0) {
     return null;
   }
+
+  const triCount = Math.floor(polyIndices.length / 3);
+  const smoothing = new Int32Array(triCount).fill(1);
 
   return {
     vertices: new Float64Array(compactVertCoords),
@@ -376,6 +413,9 @@ function buildCompactMeshArrays(mesh: ExtractedMeshData): CompactedMeshArrays | 
     normals: new Float64Array(normValues),
     uvs: new Float64Array(compactUvCoords),
     uvIndices: new Int32Array(uvIndexValues),
+    uvs2: hasUv2 ? new Float64Array(compactUv2Coords) : undefined,
+    colors: hasColors ? new Float64Array(colorValues) : undefined,
+    smoothing,
     bboxMin: [minX, minY, minZ],
     bboxMax: [maxX, maxY, maxZ],
   };
@@ -417,46 +457,135 @@ export async function convertToFbx(
     });
   }
 
+  if (meshEntries.length === 0) {
+    throw new Error(
+      'No valid non-degenerate 3D triangle geometry found to export to FBX.'
+    );
+  }
+
   const materialEntries = prepared.materials.map((mat) => ({
     mat,
     materialId: allocId(),
   }));
 
-  const textureEntries: Array<{
+  interface FbxTextureBinding {
     materialId: number;
+    property: string;
+  }
+
+  interface FbxTextureEntry {
     textureId: number;
     videoId: number;
     name: string;
+    filename: string;
     relPath: string;
-  }> = [];
+    pngData?: Uint8Array;
+    wrapU: 0 | 1;
+    wrapV: 0 | 1;
+    isNormalMap: boolean;
+    bindings: FbxTextureBinding[];
+  }
 
-  if (options.packageAsZip && options.includeMaterials) {
-    for (const mEntry of materialEntries) {
-      if (mEntry.mat.diffuseTextureName) {
-        textureEntries.push({
-          materialId: mEntry.materialId,
+  const textureEntries: FbxTextureEntry[] = [];
+
+  if (options.includeMaterials) {
+    const texByKey = new Map<string, FbxTextureEntry>();
+
+    const registerTexBinding = (
+      texFilename: string | undefined,
+      texData: Uint8Array | undefined,
+      materialId: number,
+      property: string,
+      wrapU: 0 | 1,
+      wrapV: 0 | 1,
+      isNormalMap: boolean
+    ) => {
+      if (!texFilename) return;
+      const key = `${texFilename}::${isNormalMap ? 'normal' : 'std'}`;
+      let entry = texByKey.get(key);
+      if (!entry) {
+        entry = {
           textureId: allocId(),
           videoId: allocId(),
-          name: mEntry.mat.diffuseTextureName.replace(/\.png$/i, ''),
-          relPath: `textures/${mEntry.mat.diffuseTextureName}`,
-        });
+          name: texFilename.replace(/\.png$/i, ''),
+          filename: texFilename,
+          relPath: options.packageAsZip
+            ? `textures/${texFilename}`
+            : texFilename,
+          pngData: texData,
+          wrapU,
+          wrapV,
+          isNormalMap,
+          bindings: [],
+        };
+        texByKey.set(key, entry);
+        textureEntries.push(entry);
       }
+      entry.bindings.push({ materialId, property });
+    };
+
+    for (const mEntry of materialEntries) {
+      const { mat, materialId } = mEntry;
+      registerTexBinding(
+        mat.diffuseTextureName,
+        mat.diffuseTextureData,
+        materialId,
+        'DiffuseColor',
+        mat.wrapU,
+        mat.wrapV,
+        false
+      );
+      if (mat.normalTextureName) {
+        registerTexBinding(
+          mat.normalTextureName,
+          mat.normalTextureData,
+          materialId,
+          'NormalMap',
+          mat.wrapU,
+          mat.wrapV,
+          true
+        );
+        registerTexBinding(
+          mat.normalTextureName,
+          mat.normalTextureData,
+          materialId,
+          'Bump',
+          mat.wrapU,
+          mat.wrapV,
+          true
+        );
+      }
+      registerTexBinding(
+        mat.emissiveTextureName,
+        mat.emissiveTextureData,
+        materialId,
+        'EmissiveColor',
+        mat.wrapU,
+        mat.wrapV,
+        false
+      );
+      registerTexBinding(
+        mat.specularTextureName,
+        mat.specularTextureData,
+        materialId,
+        'SpecularColor',
+        mat.wrapU,
+        mat.wrapV,
+        false
+      );
+      registerTexBinding(
+        mat.alphaTextureName,
+        mat.alphaTextureData,
+        materialId,
+        'TransparentColor',
+        mat.wrapU,
+        mat.wrapV,
+        false
+      );
     }
   }
 
-  const now = new Date();
-  const creationTimeStr = `${now.getUTCFullYear()}-${String(
-    now.getUTCMonth() + 1
-  ).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')} ${String(
-    now.getUTCHours()
-  ).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(
-    now.getUTCSeconds()
-  ).padStart(2, '0')}:000`;
-
-  const fileId = new Uint8Array([
-    0x4d, 0x65, 0x73, 0x68, 0x53, 0x68, 0x69, 0x66,
-    0x74, 0x46, 0x42, 0x58, 0x37, 0x34, 0x30, 0x30,
-  ]);
+  const fbxDocUrl = `${baseName}.fbx`;
 
   const headerExtensionNode: FbxNode = {
     name: 'FBXHeaderExtension',
@@ -468,12 +597,12 @@ export async function convertToFbx(
         name: 'CreationTimeStamp',
         children: [
           { name: 'Version', props: [{ type: 'I', value: 1000 }] },
-          { name: 'Year', props: [{ type: 'I', value: now.getUTCFullYear() }] },
-          { name: 'Month', props: [{ type: 'I', value: now.getUTCMonth() + 1 }] },
-          { name: 'Day', props: [{ type: 'I', value: now.getUTCDate() }] },
-          { name: 'Hour', props: [{ type: 'I', value: now.getUTCHours() }] },
-          { name: 'Minute', props: [{ type: 'I', value: now.getUTCMinutes() }] },
-          { name: 'Second', props: [{ type: 'I', value: now.getUTCSeconds() }] },
+          { name: 'Year', props: [{ type: 'I', value: 1970 }] },
+          { name: 'Month', props: [{ type: 'I', value: 1 }] },
+          { name: 'Day', props: [{ type: 'I', value: 1 }] },
+          { name: 'Hour', props: [{ type: 'I', value: 10 }] },
+          { name: 'Minute', props: [{ type: 'I', value: 0 }] },
+          { name: 'Second', props: [{ type: 'I', value: 0 }] },
           { name: 'Millisecond', props: [{ type: 'I', value: 0 }] },
         ],
       },
@@ -497,6 +626,79 @@ export async function convertToFbx(
               { name: 'Keywords', props: [{ type: 'S', value: '' }] },
               { name: 'Revision', props: [{ type: 'S', value: '' }] },
               { name: 'Comment', props: [{ type: 'S', value: '' }] },
+            ],
+          },
+          {
+            name: 'Properties70',
+            children: [
+              P(
+                { type: 'S', value: 'DocumentUrl' },
+                { type: 'S', value: 'KString' },
+                { type: 'S', value: 'Url' },
+                { type: 'S', value: '' },
+                { type: 'S', value: fbxDocUrl }
+              ),
+              P(
+                { type: 'S', value: 'SrcDocumentUrl' },
+                { type: 'S', value: 'KString' },
+                { type: 'S', value: 'Url' },
+                { type: 'S', value: '' },
+                { type: 'S', value: fbxDocUrl }
+              ),
+              P(
+                { type: 'S', value: 'Original' },
+                { type: 'S', value: 'Compound' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '' }
+              ),
+              P(
+                { type: 'S', value: 'Original|ApplicationVendor' },
+                { type: 'S', value: 'KString' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '' },
+                { type: 'S', value: 'MeshShift' }
+              ),
+              P(
+                { type: 'S', value: 'Original|ApplicationName' },
+                { type: 'S', value: 'KString' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '' },
+                { type: 'S', value: 'MeshShift 3D Converter' }
+              ),
+              P(
+                { type: 'S', value: 'Original|ApplicationVersion' },
+                { type: 'S', value: 'KString' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '1.0' }
+              ),
+              P(
+                { type: 'S', value: 'LastSaved' },
+                { type: 'S', value: 'Compound' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '' }
+              ),
+              P(
+                { type: 'S', value: 'LastSaved|ApplicationVendor' },
+                { type: 'S', value: 'KString' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '' },
+                { type: 'S', value: 'MeshShift' }
+              ),
+              P(
+                { type: 'S', value: 'LastSaved|ApplicationName' },
+                { type: 'S', value: 'KString' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '' },
+                { type: 'S', value: 'MeshShift 3D Converter' }
+              ),
+              P(
+                { type: 'S', value: 'LastSaved|ApplicationVersion' },
+                { type: 'S', value: 'KString' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '' },
+                { type: 'S', value: '1.0' }
+              ),
             ],
           },
         ],
@@ -638,7 +840,7 @@ export async function convertToFbx(
         name: 'Document',
         props: [
           { type: 'L', value: 1000000 },
-          { type: 'S', value: 'Scene\x00\x01Document' },
+          { type: 'S', value: 'Scene' },
           { type: 'S', value: 'Scene' },
         ],
         children: [
@@ -907,6 +1109,38 @@ export async function convertToFbx(
                   { type: 'I', value: 0 }
                 ),
                 P(
+                  { type: 'S', value: 'EmissiveColor' },
+                  { type: 'S', value: 'Color' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'EmissiveFactor' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 1 }
+                ),
+                P(
+                  { type: 'S', value: 'AmbientColor' },
+                  { type: 'S', value: 'Color' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 0.2 },
+                  { type: 'D', value: 0.2 },
+                  { type: 'D', value: 0.2 }
+                ),
+                P(
+                  { type: 'S', value: 'AmbientFactor' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 1 }
+                ),
+                P(
                   { type: 'S', value: 'DiffuseColor' },
                   { type: 'S', value: 'Color' },
                   { type: 'S', value: '' },
@@ -914,6 +1148,61 @@ export async function convertToFbx(
                   { type: 'D', value: 0.8 },
                   { type: 'D', value: 0.8 },
                   { type: 'D', value: 0.8 }
+                ),
+                P(
+                  { type: 'S', value: 'DiffuseFactor' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 1 }
+                ),
+                P(
+                  { type: 'S', value: 'Bump' },
+                  { type: 'S', value: 'Vector3D' },
+                  { type: 'S', value: 'Vector' },
+                  { type: 'S', value: '' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'NormalMap' },
+                  { type: 'S', value: 'Vector3D' },
+                  { type: 'S', value: 'Vector' },
+                  { type: 'S', value: '' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'BumpFactor' },
+                  { type: 'S', value: 'double' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'D', value: 1 }
+                ),
+                P(
+                  { type: 'S', value: 'TransparentColor' },
+                  { type: 'S', value: 'Color' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'TransparencyFactor' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'Opacity' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 1 }
                 ),
                 P(
                   { type: 'S', value: 'SpecularColor' },
@@ -925,6 +1214,20 @@ export async function convertToFbx(
                   { type: 'D', value: 0.2 }
                 ),
                 P(
+                  { type: 'S', value: 'SpecularFactor' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 0.5 }
+                ),
+                P(
+                  { type: 'S', value: 'Shininess' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 20 }
+                ),
+                P(
                   { type: 'S', value: 'ShininessExponent' },
                   { type: 'S', value: 'Number' },
                   { type: 'S', value: '' },
@@ -932,11 +1235,20 @@ export async function convertToFbx(
                   { type: 'D', value: 20 }
                 ),
                 P(
-                  { type: 'S', value: 'Opacity' },
+                  { type: 'S', value: 'ReflectionColor' },
+                  { type: 'S', value: 'Color' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'ReflectionFactor' },
                   { type: 'S', value: 'Number' },
                   { type: 'S', value: '' },
                   { type: 'S', value: 'A' },
-                  { type: 'D', value: 1 }
+                  { type: 'D', value: 0 }
                 ),
               ],
             },
@@ -952,6 +1264,139 @@ export async function convertToFbx(
       props: [{ type: 'S', value: 'Texture' }],
       children: [
         { name: 'Count', props: [{ type: 'I', value: textureEntries.length }] },
+        {
+          name: 'PropertyTemplate',
+          props: [{ type: 'S', value: 'FbxFileTexture' }],
+          children: [
+            {
+              name: 'Properties70',
+              children: [
+                P(
+                  { type: 'S', value: 'TextureTypeUse' },
+                  { type: 'S', value: 'enum' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'Texture alpha' },
+                  { type: 'S', value: 'Number' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 1 }
+                ),
+                P(
+                  { type: 'S', value: 'CurrentMappingType' },
+                  { type: 'S', value: 'enum' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'WrapModeU' },
+                  { type: 'S', value: 'enum' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'WrapModeV' },
+                  { type: 'S', value: 'enum' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'UVSwap' },
+                  { type: 'S', value: 'bool' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'PremultiplyAlpha' },
+                  { type: 'S', value: 'bool' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 1 }
+                ),
+                P(
+                  { type: 'S', value: 'Translation' },
+                  { type: 'S', value: 'Vector' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'Rotation' },
+                  { type: 'S', value: 'Vector' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'Scaling' },
+                  { type: 'S', value: 'Vector' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'A' },
+                  { type: 'D', value: 1 },
+                  { type: 'D', value: 1 },
+                  { type: 'D', value: 1 }
+                ),
+                P(
+                  { type: 'S', value: 'TextureRotationPivot' },
+                  { type: 'S', value: 'Vector3D' },
+                  { type: 'S', value: 'Vector' },
+                  { type: 'S', value: '' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'TextureScalingPivot' },
+                  { type: 'S', value: 'Vector3D' },
+                  { type: 'S', value: 'Vector' },
+                  { type: 'S', value: '' },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 },
+                  { type: 'D', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'CurrentTextureBlendMode' },
+                  { type: 'S', value: 'enum' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 1 }
+                ),
+                P(
+                  { type: 'S', value: 'UVSet' },
+                  { type: 'S', value: 'KString' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: 'UVMap' }
+                ),
+                P(
+                  { type: 'S', value: 'UseMaterial' },
+                  { type: 'S', value: 'bool' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 1 }
+                ),
+                P(
+                  { type: 'S', value: 'UseMipMap' },
+                  { type: 'S', value: 'bool' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+              ],
+            },
+          ],
+        },
       ],
     });
     definitionChildren.push({
@@ -959,6 +1404,38 @@ export async function convertToFbx(
       props: [{ type: 'S', value: 'Video' }],
       children: [
         { name: 'Count', props: [{ type: 'I', value: textureEntries.length }] },
+        {
+          name: 'PropertyTemplate',
+          props: [{ type: 'S', value: 'FbxVideo' }],
+          children: [
+            {
+              name: 'Properties70',
+              children: [
+                P(
+                  { type: 'S', value: 'ImageSequence' },
+                  { type: 'S', value: 'bool' },
+                  { type: 'S', value: '' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'Width' },
+                  { type: 'S', value: 'int' },
+                  { type: 'S', value: 'Integer' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+                P(
+                  { type: 'S', value: 'Height' },
+                  { type: 'S', value: 'int' },
+                  { type: 'S', value: 'Integer' },
+                  { type: 'S', value: '' },
+                  { type: 'I', value: 0 }
+                ),
+              ],
+            },
+          ],
+        },
       ],
     });
   }
@@ -1051,6 +1528,248 @@ export async function convertToFbx(
       ],
     });
 
+    const layer0Elements: FbxNode[] = [
+      {
+        name: 'LayerElement',
+        children: [
+          {
+            name: 'Type',
+            props: [{ type: 'S', value: 'LayerElementNormal' }],
+          },
+          { name: 'TypedIndex', props: [{ type: 'I', value: 0 }] },
+        ],
+      },
+      {
+        name: 'LayerElement',
+        children: [
+          {
+            name: 'Type',
+            props: [{ type: 'S', value: 'LayerElementSmoothing' }],
+          },
+          { name: 'TypedIndex', props: [{ type: 'I', value: 0 }] },
+        ],
+      },
+      {
+        name: 'LayerElement',
+        children: [
+          {
+            name: 'Type',
+            props: [{ type: 'S', value: 'LayerElementMaterial' }],
+          },
+          { name: 'TypedIndex', props: [{ type: 'I', value: 0 }] },
+        ],
+      },
+      {
+        name: 'LayerElement',
+        children: [
+          {
+            name: 'Type',
+            props: [{ type: 'S', value: 'LayerElementUV' }],
+          },
+          { name: 'TypedIndex', props: [{ type: 'I', value: 0 }] },
+        ],
+      },
+    ];
+
+    const geomChildren: FbxNode[] = [
+      {
+        name: 'Properties70',
+        children: [
+          P(
+            { type: 'S', value: 'Color' },
+            { type: 'S', value: 'ColorRGB' },
+            { type: 'S', value: 'Color' },
+            { type: 'S', value: '' },
+            { type: 'D', value: 0.8 },
+            { type: 'D', value: 0.8 },
+            { type: 'D', value: 0.8 }
+          ),
+          P(
+            { type: 'S', value: 'BBoxMin' },
+            { type: 'S', value: 'Vector3D' },
+            { type: 'S', value: 'Vector' },
+            { type: 'S', value: '' },
+            { type: 'D', value: arrays.bboxMin[0] },
+            { type: 'D', value: arrays.bboxMin[1] },
+            { type: 'D', value: arrays.bboxMin[2] }
+          ),
+          P(
+            { type: 'S', value: 'BBoxMax' },
+            { type: 'S', value: 'Vector3D' },
+            { type: 'S', value: 'Vector' },
+            { type: 'S', value: '' },
+            { type: 'D', value: arrays.bboxMax[0] },
+            { type: 'D', value: arrays.bboxMax[1] },
+            { type: 'D', value: arrays.bboxMax[2] }
+          ),
+        ],
+      },
+      { name: 'Vertices', props: [{ type: 'd', value: arrays.vertices }] },
+      {
+        name: 'PolygonVertexIndex',
+        props: [{ type: 'i', value: arrays.polygonVertexIndex }],
+      },
+      { name: 'Edges', props: [{ type: 'i', value: arrays.edges }] },
+      { name: 'GeometryVersion', props: [{ type: 'I', value: 124 }] },
+      {
+        name: 'LayerElementNormal',
+        props: [{ type: 'I', value: 0 }],
+        children: [
+          { name: 'Version', props: [{ type: 'I', value: 101 }] },
+          { name: 'Name', props: [{ type: 'S', value: '' }] },
+          {
+            name: 'MappingInformationType',
+            props: [{ type: 'S', value: 'ByPolygonVertex' }],
+          },
+          {
+            name: 'ReferenceInformationType',
+            props: [{ type: 'S', value: 'Direct' }],
+          },
+          { name: 'Normals', props: [{ type: 'd', value: arrays.normals }] },
+        ],
+      },
+      {
+        name: 'LayerElementSmoothing',
+        props: [{ type: 'I', value: 0 }],
+        children: [
+          { name: 'Version', props: [{ type: 'I', value: 102 }] },
+          { name: 'Name', props: [{ type: 'S', value: '' }] },
+          {
+            name: 'MappingInformationType',
+            props: [{ type: 'S', value: 'ByPolygon' }],
+          },
+          {
+            name: 'ReferenceInformationType',
+            props: [{ type: 'S', value: 'Direct' }],
+          },
+          {
+            name: 'Smoothing',
+            props: [{ type: 'i', value: arrays.smoothing }],
+          },
+        ],
+      },
+    ];
+
+    if (arrays.colors) {
+      geomChildren.push({
+        name: 'LayerElementColor',
+        props: [{ type: 'I', value: 0 }],
+        children: [
+          { name: 'Version', props: [{ type: 'I', value: 101 }] },
+          { name: 'Name', props: [{ type: 'S', value: 'Col' }] },
+          {
+            name: 'MappingInformationType',
+            props: [{ type: 'S', value: 'ByPolygonVertex' }],
+          },
+          {
+            name: 'ReferenceInformationType',
+            props: [{ type: 'S', value: 'Direct' }],
+          },
+          { name: 'Colors', props: [{ type: 'd', value: arrays.colors }] },
+        ],
+      });
+      layer0Elements.push({
+        name: 'LayerElement',
+        children: [
+          {
+            name: 'Type',
+            props: [{ type: 'S', value: 'LayerElementColor' }],
+          },
+          { name: 'TypedIndex', props: [{ type: 'I', value: 0 }] },
+        ],
+      });
+    }
+
+    geomChildren.push({
+      name: 'LayerElementUV',
+      props: [{ type: 'I', value: 0 }],
+      children: [
+        { name: 'Version', props: [{ type: 'I', value: 101 }] },
+        { name: 'Name', props: [{ type: 'S', value: 'UVMap' }] },
+        {
+          name: 'MappingInformationType',
+          props: [{ type: 'S', value: 'ByPolygonVertex' }],
+        },
+        {
+          name: 'ReferenceInformationType',
+          props: [{ type: 'S', value: 'IndexToDirect' }],
+        },
+        { name: 'UV', props: [{ type: 'd', value: arrays.uvs }] },
+        { name: 'UVIndex', props: [{ type: 'i', value: arrays.uvIndices }] },
+      ],
+    });
+
+    if (arrays.uvs2) {
+      geomChildren.push({
+        name: 'LayerElementUV',
+        props: [{ type: 'I', value: 1 }],
+        children: [
+          { name: 'Version', props: [{ type: 'I', value: 101 }] },
+          { name: 'Name', props: [{ type: 'S', value: 'UVMap_2' }] },
+          {
+            name: 'MappingInformationType',
+            props: [{ type: 'S', value: 'ByPolygonVertex' }],
+          },
+          {
+            name: 'ReferenceInformationType',
+            props: [{ type: 'S', value: 'IndexToDirect' }],
+          },
+          { name: 'UV', props: [{ type: 'd', value: arrays.uvs2 }] },
+          { name: 'UVIndex', props: [{ type: 'i', value: arrays.uvIndices }] },
+        ],
+      });
+    }
+
+    geomChildren.push({
+      name: 'LayerElementMaterial',
+      props: [{ type: 'I', value: 0 }],
+      children: [
+        { name: 'Version', props: [{ type: 'I', value: 101 }] },
+        { name: 'Name', props: [{ type: 'S', value: '' }] },
+        {
+          name: 'MappingInformationType',
+          props: [{ type: 'S', value: 'AllSame' }],
+        },
+        {
+          name: 'ReferenceInformationType',
+          props: [{ type: 'S', value: 'IndexToDirect' }],
+        },
+        {
+          name: 'Materials',
+          props: [{ type: 'i', value: new Int32Array([0]) }],
+        },
+      ],
+    });
+
+    geomChildren.push({
+      name: 'Layer',
+      props: [{ type: 'I', value: 0 }],
+      children: [
+        { name: 'Version', props: [{ type: 'I', value: 100 }] },
+        ...layer0Elements,
+      ],
+    });
+
+    if (arrays.uvs2) {
+      geomChildren.push({
+        name: 'Layer',
+        props: [{ type: 'I', value: 1 }],
+        children: [
+          { name: 'Version', props: [{ type: 'I', value: 100 }] },
+          {
+            name: 'LayerElement',
+            children: [
+              {
+                name: 'Type',
+                props: [{ type: 'S', value: 'LayerElementUV' }],
+              },
+              { name: 'TypedIndex', props: [{ type: 'I', value: 1 }] },
+            ],
+          },
+        ],
+      });
+    }
+
     objectChildren.push({
       name: 'Geometry',
       props: [
@@ -1058,139 +1777,7 @@ export async function convertToFbx(
         { type: 'S', value: `${mesh.name}\x00\x01Geometry` },
         { type: 'S', value: 'Mesh' },
       ],
-      children: [
-        {
-          name: 'Properties70',
-          children: [
-            P(
-              { type: 'S', value: 'Color' },
-              { type: 'S', value: 'ColorRGB' },
-              { type: 'S', value: 'Color' },
-              { type: 'S', value: '' },
-              { type: 'D', value: 0.8 },
-              { type: 'D', value: 0.8 },
-              { type: 'D', value: 0.8 }
-            ),
-            P(
-              { type: 'S', value: 'BBoxMin' },
-              { type: 'S', value: 'Vector3D' },
-              { type: 'S', value: 'Vector' },
-              { type: 'S', value: '' },
-              { type: 'D', value: arrays.bboxMin[0] },
-              { type: 'D', value: arrays.bboxMin[1] },
-              { type: 'D', value: arrays.bboxMin[2] }
-            ),
-            P(
-              { type: 'S', value: 'BBoxMax' },
-              { type: 'S', value: 'Vector3D' },
-              { type: 'S', value: 'Vector' },
-              { type: 'S', value: '' },
-              { type: 'D', value: arrays.bboxMax[0] },
-              { type: 'D', value: arrays.bboxMax[1] },
-              { type: 'D', value: arrays.bboxMax[2] }
-            ),
-          ],
-        },
-        { name: 'Vertices', props: [{ type: 'd', value: arrays.vertices }] },
-        {
-          name: 'PolygonVertexIndex',
-          props: [{ type: 'i', value: arrays.polygonVertexIndex }],
-        },
-        { name: 'Edges', props: [{ type: 'i', value: arrays.edges }] },
-        { name: 'GeometryVersion', props: [{ type: 'I', value: 124 }] },
-        {
-          name: 'LayerElementNormal',
-          props: [{ type: 'I', value: 0 }],
-          children: [
-            { name: 'Version', props: [{ type: 'I', value: 101 }] },
-            { name: 'Name', props: [{ type: 'S', value: '' }] },
-            {
-              name: 'MappingInformationType',
-              props: [{ type: 'S', value: 'ByPolygonVertex' }],
-            },
-            {
-              name: 'ReferenceInformationType',
-              props: [{ type: 'S', value: 'Direct' }],
-            },
-            { name: 'Normals', props: [{ type: 'd', value: arrays.normals }] },
-          ],
-        },
-        {
-          name: 'LayerElementUV',
-          props: [{ type: 'I', value: 0 }],
-          children: [
-            { name: 'Version', props: [{ type: 'I', value: 101 }] },
-            { name: 'Name', props: [{ type: 'S', value: 'UVMap' }] },
-            {
-              name: 'MappingInformationType',
-              props: [{ type: 'S', value: 'ByPolygonVertex' }],
-            },
-            {
-              name: 'ReferenceInformationType',
-              props: [{ type: 'S', value: 'IndexToDirect' }],
-            },
-            { name: 'UV', props: [{ type: 'd', value: arrays.uvs }] },
-            { name: 'UVIndex', props: [{ type: 'i', value: arrays.uvIndices }] },
-          ],
-        },
-        {
-          name: 'LayerElementMaterial',
-          props: [{ type: 'I', value: 0 }],
-          children: [
-            { name: 'Version', props: [{ type: 'I', value: 101 }] },
-            { name: 'Name', props: [{ type: 'S', value: '' }] },
-            {
-              name: 'MappingInformationType',
-              props: [{ type: 'S', value: 'AllSame' }],
-            },
-            {
-              name: 'ReferenceInformationType',
-              props: [{ type: 'S', value: 'IndexToDirect' }],
-            },
-            {
-              name: 'Materials',
-              props: [{ type: 'i', value: new Int32Array([0]) }],
-            },
-          ],
-        },
-        {
-          name: 'Layer',
-          props: [{ type: 'I', value: 0 }],
-          children: [
-            { name: 'Version', props: [{ type: 'I', value: 100 }] },
-            {
-              name: 'LayerElement',
-              children: [
-                {
-                  name: 'Type',
-                  props: [{ type: 'S', value: 'LayerElementNormal' }],
-                },
-                { name: 'TypedIndex', props: [{ type: 'I', value: 0 }] },
-              ],
-            },
-            {
-              name: 'LayerElement',
-              children: [
-                {
-                  name: 'Type',
-                  props: [{ type: 'S', value: 'LayerElementMaterial' }],
-                },
-                { name: 'TypedIndex', props: [{ type: 'I', value: 0 }] },
-              ],
-            },
-            {
-              name: 'LayerElement',
-              children: [
-                {
-                  name: 'Type',
-                  props: [{ type: 'S', value: 'LayerElementUV' }],
-                },
-                { name: 'TypedIndex', props: [{ type: 'I', value: 0 }] },
-              ],
-            },
-          ],
-        },
-      ],
+      children: geomChildren,
     });
   }
 
@@ -1198,6 +1785,13 @@ export async function convertToFbx(
     const { mat, materialId } = mEntry;
     const spec = Math.max(0.05, 1 - mat.roughness) * 0.5;
     const shininess = Math.max(2, Math.round((1 - mat.roughness) * 96));
+    const opacity = Math.min(1, Math.max(0, safeNum(mat.opacity, 1)));
+    const cr = safeNum(mat.color[0], 0.8);
+    const cg = safeNum(mat.color[1], 0.8);
+    const cb = safeNum(mat.color[2], 0.8);
+    const er = safeNum(mat.emissive[0], 0);
+    const eg = safeNum(mat.emissive[1], 0);
+    const eb = safeNum(mat.emissive[2], 0);
 
     objectChildren.push({
       name: 'Material',
@@ -1208,7 +1802,7 @@ export async function convertToFbx(
       ],
       children: [
         { name: 'Version', props: [{ type: 'I', value: 102 }] },
-        { name: 'ShadingModel', props: [{ type: 'S', value: 'phong' }] },
+        { name: 'ShadingModel', props: [{ type: 'S', value: 'Phong' }] },
         { name: 'MultiLayer', props: [{ type: 'I', value: 0 }] },
         {
           name: 'Properties70',
@@ -1218,16 +1812,64 @@ export async function convertToFbx(
               { type: 'S', value: 'KString' },
               { type: 'S', value: '' },
               { type: 'S', value: '' },
-              { type: 'S', value: 'phong' }
+              { type: 'S', value: 'Phong' }
+            ),
+            P(
+              { type: 'S', value: 'MultiLayer' },
+              { type: 'S', value: 'bool' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'AmbientColor' },
+              { type: 'S', value: 'Color' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 0.2 },
+              { type: 'D', value: 0.2 },
+              { type: 'D', value: 0.2 }
+            ),
+            P(
+              { type: 'S', value: 'Ambient' },
+              { type: 'S', value: 'Vector3D' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'D', value: 0.2 },
+              { type: 'D', value: 0.2 },
+              { type: 'D', value: 0.2 }
+            ),
+            P(
+              { type: 'S', value: 'AmbientFactor' },
+              { type: 'S', value: 'Number' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 1 }
             ),
             P(
               { type: 'S', value: 'DiffuseColor' },
               { type: 'S', value: 'Color' },
               { type: 'S', value: '' },
               { type: 'S', value: 'A' },
-              { type: 'D', value: safeNum(mat.color[0], 0.8) },
-              { type: 'D', value: safeNum(mat.color[1], 0.8) },
-              { type: 'D', value: safeNum(mat.color[2], 0.8) }
+              { type: 'D', value: cr },
+              { type: 'D', value: cg },
+              { type: 'D', value: cb }
+            ),
+            P(
+              { type: 'S', value: 'Diffuse' },
+              { type: 'S', value: 'Vector3D' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'D', value: cr },
+              { type: 'D', value: cg },
+              { type: 'D', value: cb }
+            ),
+            P(
+              { type: 'S', value: 'DiffuseFactor' },
+              { type: 'S', value: 'Number' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 1 }
             ),
             P(
               { type: 'S', value: 'SpecularColor' },
@@ -1239,13 +1881,52 @@ export async function convertToFbx(
               { type: 'D', value: spec }
             ),
             P(
+              { type: 'S', value: 'Specular' },
+              { type: 'S', value: 'Vector3D' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'D', value: spec },
+              { type: 'D', value: spec },
+              { type: 'D', value: spec }
+            ),
+            P(
+              { type: 'S', value: 'SpecularFactor' },
+              { type: 'S', value: 'Number' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 0.5 }
+            ),
+            P(
               { type: 'S', value: 'EmissiveColor' },
               { type: 'S', value: 'Color' },
               { type: 'S', value: '' },
               { type: 'S', value: 'A' },
-              { type: 'D', value: safeNum(mat.emissive[0], 0) },
-              { type: 'D', value: safeNum(mat.emissive[1], 0) },
-              { type: 'D', value: safeNum(mat.emissive[2], 0) }
+              { type: 'D', value: er },
+              { type: 'D', value: eg },
+              { type: 'D', value: eb }
+            ),
+            P(
+              { type: 'S', value: 'Emissive' },
+              { type: 'S', value: 'Vector3D' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'D', value: er },
+              { type: 'D', value: eg },
+              { type: 'D', value: eb }
+            ),
+            P(
+              { type: 'S', value: 'EmissiveFactor' },
+              { type: 'S', value: 'Number' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 1 }
+            ),
+            P(
+              { type: 'S', value: 'Shininess' },
+              { type: 'S', value: 'Number' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: shininess }
             ),
             P(
               { type: 'S', value: 'ShininessExponent' },
@@ -1255,11 +1936,34 @@ export async function convertToFbx(
               { type: 'D', value: shininess }
             ),
             P(
+              { type: 'S', value: 'TransparentColor' },
+              { type: 'S', value: 'Color' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'TransparencyFactor' },
+              { type: 'S', value: 'Number' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 1 - opacity }
+            ),
+            P(
               { type: 'S', value: 'Opacity' },
               { type: 'S', value: 'Number' },
               { type: 'S', value: '' },
               { type: 'S', value: 'A' },
-              { type: 'D', value: safeNum(mat.opacity, 1) }
+              { type: 'D', value: opacity }
+            ),
+            P(
+              { type: 'S', value: 'BumpFactor' },
+              { type: 'S', value: 'double' },
+              { type: 'S', value: 'Number' },
+              { type: 'S', value: '' },
+              { type: 'D', value: 1 }
             ),
           ],
         },
@@ -1268,6 +1972,36 @@ export async function convertToFbx(
   }
 
   for (const tEntry of textureEntries) {
+    const videoChildren: FbxNode[] = [
+      { name: 'Type', props: [{ type: 'S', value: 'Clip' }] },
+      {
+        name: 'Properties70',
+        children: [
+          P(
+            { type: 'S', value: 'Path' },
+            { type: 'S', value: 'KString' },
+            { type: 'S', value: 'XRefUrl' },
+            { type: 'S', value: '' },
+            { type: 'S', value: tEntry.relPath }
+          ),
+        ],
+      },
+      { name: 'UseMipMap', props: [{ type: 'I', value: 0 }] },
+      { name: 'FileName', props: [{ type: 'S', value: tEntry.relPath }] },
+      { name: 'Filename', props: [{ type: 'S', value: tEntry.relPath }] },
+      {
+        name: 'RelativeFilename',
+        props: [{ type: 'S', value: tEntry.relPath }],
+      },
+    ];
+
+    if (tEntry.pngData && tEntry.pngData.byteLength > 0) {
+      videoChildren.push({
+        name: 'Content',
+        props: [{ type: 'R', value: tEntry.pngData }],
+      });
+    }
+
     objectChildren.push({
       name: 'Video',
       props: [
@@ -1275,27 +2009,7 @@ export async function convertToFbx(
         { type: 'S', value: `${tEntry.name}\x00\x01Video` },
         { type: 'S', value: 'Clip' },
       ],
-      children: [
-        { name: 'Type', props: [{ type: 'S', value: 'Clip' }] },
-        {
-          name: 'Properties70',
-          children: [
-            P(
-              { type: 'S', value: 'Path' },
-              { type: 'S', value: 'KString' },
-              { type: 'S', value: 'XRefUrl' },
-              { type: 'S', value: '' },
-              { type: 'S', value: tEntry.relPath }
-            ),
-          ],
-        },
-        { name: 'UseMipMap', props: [{ type: 'I', value: 0 }] },
-        { name: 'Filename', props: [{ type: 'S', value: tEntry.relPath }] },
-        {
-          name: 'RelativeFilename',
-          props: [{ type: 'S', value: tEntry.relPath }],
-        },
-      ],
+      children: videoChildren,
     });
 
     objectChildren.push({
@@ -1311,6 +2025,140 @@ export async function convertToFbx(
         {
           name: 'TextureName',
           props: [{ type: 'S', value: `${tEntry.name}\x00\x01Texture` }],
+        },
+        {
+          name: 'Properties70',
+          children: [
+            P(
+              { type: 'S', value: 'TextureTypeUse' },
+              { type: 'S', value: 'enum' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: tEntry.isNormalMap ? 1 : 0 }
+            ),
+            P(
+              { type: 'S', value: 'Texture alpha' },
+              { type: 'S', value: 'Number' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 1 }
+            ),
+            P(
+              { type: 'S', value: 'CurrentMappingType' },
+              { type: 'S', value: 'enum' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'WrapModeU' },
+              { type: 'S', value: 'enum' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: tEntry.wrapU }
+            ),
+            P(
+              { type: 'S', value: 'WrapModeV' },
+              { type: 'S', value: 'enum' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: tEntry.wrapV }
+            ),
+            P(
+              { type: 'S', value: 'UVSwap' },
+              { type: 'S', value: 'bool' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'PremultiplyAlpha' },
+              { type: 'S', value: 'bool' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: 1 }
+            ),
+            P(
+              { type: 'S', value: 'Translation' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'Rotation' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'Scaling' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'A' },
+              { type: 'D', value: 1 },
+              { type: 'D', value: 1 },
+              { type: 'D', value: 1 }
+            ),
+            P(
+              { type: 'S', value: 'TextureRotationPivot' },
+              { type: 'S', value: 'Vector3D' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'TextureScalingPivot' },
+              { type: 'S', value: 'Vector3D' },
+              { type: 'S', value: 'Vector' },
+              { type: 'S', value: '' },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 },
+              { type: 'D', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'CurrentTextureBlendMode' },
+              { type: 'S', value: 'enum' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: 1 }
+            ),
+            P(
+              { type: 'S', value: 'UVSet' },
+              { type: 'S', value: 'KString' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'S', value: 'UVMap' }
+            ),
+            P(
+              { type: 'S', value: 'UseMaterial' },
+              { type: 'S', value: 'bool' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: 1 }
+            ),
+            P(
+              { type: 'S', value: 'UseMipMap' },
+              { type: 'S', value: 'bool' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: 0 }
+            ),
+            P(
+              { type: 'S', value: 'AlphaSource' },
+              { type: 'S', value: 'enum' },
+              { type: 'S', value: '' },
+              { type: 'S', value: '' },
+              { type: 'I', value: 2 }
+            ),
+          ],
         },
         {
           name: 'Media',
@@ -1388,15 +2236,17 @@ export async function convertToFbx(
   }
 
   for (const tEntry of textureEntries) {
-    connectionChildren.push({
-      name: 'C',
-      props: [
-        { type: 'S', value: 'OP' },
-        { type: 'L', value: tEntry.textureId },
-        { type: 'L', value: tEntry.materialId },
-        { type: 'S', value: 'DiffuseColor' },
-      ],
-    });
+    for (const binding of tEntry.bindings) {
+      connectionChildren.push({
+        name: 'C',
+        props: [
+          { type: 'S', value: 'OP' },
+          { type: 'L', value: tEntry.textureId },
+          { type: 'L', value: binding.materialId },
+          { type: 'S', value: binding.property },
+        ],
+      });
+    }
     connectionChildren.push({
       name: 'C',
       props: [
@@ -1426,10 +2276,13 @@ export async function convertToFbx(
   writer.writeUint32(FBX_VERSION);
 
   writer.writeNode(headerExtensionNode);
-  writer.writeNode({ name: 'FileId', props: [{ type: 'R', value: fileId }] });
+  writer.writeNode({
+    name: 'FileId',
+    props: [{ type: 'R', value: FBX_FILE_ID }],
+  });
   writer.writeNode({
     name: 'CreationTime',
-    props: [{ type: 'S', value: creationTimeStr }],
+    props: [{ type: 'S', value: FBX_CREATION_TIME }],
   });
   writer.writeNode({
     name: 'Creator',

@@ -92,6 +92,98 @@ export function extractModelStats(gltf: GLTF): ModelStats {
   };
 }
 
+async function attachEmbeddedTextureBytes(gltf: GLTF): Promise<void> {
+  const parser = gltf.parser as unknown as {
+    json?: {
+      textures?: Array<{
+        source?: number;
+        name?: string;
+        extensions?: Record<string, { source?: number }>;
+      }>;
+      images?: Array<{
+        bufferView?: number;
+        mimeType?: string;
+        name?: string;
+      }>;
+    };
+    associations?: Map<unknown, { textures?: number }>;
+    getDependency?: (type: string, index: number) => Promise<ArrayBuffer>;
+  };
+
+  if (
+    !parser ||
+    !parser.json ||
+    !parser.associations ||
+    typeof parser.getDependency !== 'function'
+  ) {
+    return;
+  }
+
+  const visited = new Set<string>();
+  const tasks: Promise<void>[] = [];
+
+  gltf.scene.traverse((obj) => {
+    if (!(obj as THREE.Mesh).isMesh) return;
+    const mesh = obj as THREE.Mesh;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const mat of mats) {
+      if (!mat) continue;
+      const std = mat as THREE.MeshStandardMaterial;
+      const slots = [
+        std.map,
+        std.normalMap,
+        std.emissiveMap,
+        std.roughnessMap,
+        std.metalnessMap,
+        std.aoMap,
+        std.alphaMap,
+      ];
+      for (const tex of slots) {
+        if (!tex || visited.has(tex.uuid)) continue;
+        visited.add(tex.uuid);
+
+        const assoc = parser.associations?.get(tex);
+        const texIndex = assoc?.textures;
+        if (typeof texIndex !== 'number') continue;
+
+        const texDef = parser.json?.textures?.[texIndex];
+        if (!texDef) continue;
+
+        const sourceIndex =
+          texDef.source ??
+          texDef.extensions?.EXT_texture_webp?.source ??
+          texDef.extensions?.KHR_texture_basisu?.source;
+        if (typeof sourceIndex !== 'number') continue;
+
+        const imgDef = parser.json?.images?.[sourceIndex];
+        if (!imgDef || typeof imgDef.bufferView !== 'number') continue;
+
+        const bufferViewIndex = imgDef.bufferView;
+        tasks.push(
+          parser
+            .getDependency!('bufferView', bufferViewIndex)
+            .then((ab) => {
+              if (ab && ab.byteLength > 0) {
+                tex.userData = tex.userData || {};
+                tex.userData.rawBytes = new Uint8Array(ab.slice(0));
+                if (imgDef.mimeType && !tex.userData.mimeType) {
+                  tex.userData.mimeType = imgDef.mimeType;
+                }
+              }
+            })
+            .catch(() => {
+              // Ignore fallback error if bufferView is unavailable
+            })
+        );
+      }
+    }
+  });
+
+  if (tasks.length > 0) {
+    await Promise.all(tasks);
+  }
+}
+
 export async function parseGlbBuffer(
   buffer: ArrayBuffer
 ): Promise<{ scene: THREE.Group; stats: ModelStats }> {
@@ -111,6 +203,8 @@ export async function parseGlbBuffer(
         )
     );
   });
+
+  await attachEmbeddedTextureBytes(gltf);
 
   const stats = extractModelStats(gltf);
 

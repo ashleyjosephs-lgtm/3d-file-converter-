@@ -119,6 +119,18 @@ export async function convertToObj(
     if (mat.diffuseTextureName) {
       mtlLines.push(`map_Kd textures/${mat.diffuseTextureName}`);
     }
+    if (mat.normalTextureName) {
+      mtlLines.push(`map_Bump textures/${mat.normalTextureName}`);
+    }
+    if (mat.emissiveTextureName) {
+      mtlLines.push(`map_Ke textures/${mat.emissiveTextureName}`);
+    }
+    if (mat.specularTextureName) {
+      mtlLines.push(`map_Ns textures/${mat.specularTextureName}`);
+    }
+    if (mat.alphaTextureName) {
+      mtlLines.push(`map_d textures/${mat.alphaTextureName}`);
+    }
     mtlLines.push('');
   }
   const mtlContent = mtlLines.join('\n');
